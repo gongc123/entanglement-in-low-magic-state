@@ -1,13 +1,17 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
-import random
-import cirq
-import math
+import random, cirq, math, itertools
 import numpy as np
 from typing import List, Tuple, Optional, Sequence, Dict, Iterable
 from collections import defaultdict
+from numpy.linalg import norm
 
+
+def entropy(rho):
+    ens = np.linalg.eigvals(rho)
+    ens = [ele for ele in ens if ele> 0.000000000001]
+    return float(sum([-ele*np.log2(ele) for ele in ens]).real)
 
 def random_1q_clifford(rng: random.Random) -> cirq.Gate:
     # A simple generating set for single-qubit Cliffords.
@@ -273,12 +277,14 @@ def paulistring_to_xz_sign(ps: cirq.PauliString, qubits: Sequence[cirq.Qid]) -> 
 
 
 def xz_sign_to_paulistring(
-    x: np.ndarray,
-    z: np.ndarray,
+    xz: np.ndarray,
     sign: int,
     qubits: Sequence[cirq.Qid],
 ) -> cirq.PauliString:
     d: Dict[cirq.Qid, cirq.Pauli] = {}
+    n = len(qubits)
+    x = xz[:n] & 1
+    z = xz[n:] & 1
     for i, q in enumerate(qubits):
         xi = int(x[i])
         zi = int(z[i])
@@ -935,19 +941,8 @@ def _conjugate_paulistring_by_rz_dag(
     raise ValueError(f"Unexpected Pauli {p} on qubit {q}")
 
 
-def _expectation_on_zero(ps: cirq.PauliString) -> complex:
-    """
-    <0^n| ps |0^n>.
-    Nonzero iff ps contains only I/Z on every qubit.
-    In that case it's just ps.coefficient (since Z|0>=|0>).
-    """
-    for _, p in dict(ps).items():
-        if p == cirq.X or p == cirq.Y:
-            return 0.0
-    return complex(ps.coefficient)
 
-
-def expectation_paulistring_clifford_plus_few_magic(
+def push_paulistring_clifford_plus_few_magic(
     circuit: cirq.Circuit,
     pauli: cirq.PauliString,
     *,
@@ -993,12 +988,62 @@ def expectation_paulistring_clifford_plus_few_magic(
 
         # optional: prune tiny coefficients
         terms = {ps: c for ps, c in new_terms.items() if abs(c) > magic_tolerance}
-        
+
+    return terms
+    
+
+def multiply_pauli_op_dicts(A, B):
+    """
+    Multiply two operators A and B represented as dicts {cirq.PauliString: coeff}.
+    Returns dict in the same form, with canonicalized PauliString keys (coefficient=1).
+    """
+    out = {}
+
+    for ps_a, a in A.items():
+        if a == 0:
+            continue
+        for ps_b, b in B.items():
+            if b == 0:
+                continue
+
+            prod = ps_a * ps_b  # Cirq handles Pauli multiplication + phase
+            ps = cirq.ops.pauli_string.PauliString(dict(prod.items()))
+            fac = a*b*prod.coefficient
+            if ps in out:
+                out[ps] += fac
+            else:
+                out[ps] = fac
+
+    return out
+    
+def _expectation_on_zero(ps: cirq.PauliString) -> complex:
+    """
+    <0^n| ps |0^n>.
+    Nonzero iff ps contains only I/Z on every qubit.
+    In that case it's just ps.coefficient (since Z|0>=|0>).
+    """
+    for _, p in dict(ps).items():
+        if p == cirq.X or p == cirq.Y:
+            return 0.0
+    return complex(ps.coefficient)
+
+
+def expectation_from_terms(terms):
     # Final expectation on |0^n>
     expval = 0.0 + 0.0j
     for ps, coeff in terms.items():
         expval += coeff * _expectation_on_zero(ps)
     return expval
+
+
+def all_subsets(input_list):
+    """Generates all possible subsets of a given list."""
+    s = list(input_list)
+    return [
+        list(subset)
+        for r in range(len(s) + 1)
+        for subset in itertools.combinations(s, r)
+    ]
 
 
 def logical_tomography(circuit, pairs, singlets):
@@ -1007,24 +1052,250 @@ def logical_tomography(circuit, pairs, singlets):
     """
     l1 = len(pairs)
     l2 = len(singlets)
+    N = 2*l1+l2
     bulkq = cirq.LineQubit.range(l1+l2)
+    P_list = [cirq.PauliString({bulkq[k]:cirq.X}) for k in range(l1)]
+    P_list.extend([cirq.PauliString({bulkq[k]:cirq.Z}) for k in range(l1+l2)]) 
+    P_rep_list = [pairs[k][0] for k in range(l1)]
+    P_rep_list.extend([pairs[k][1] for k in range(l1)])
+    P_rep_list.extend([singlets[k] for k in range(l2)])
+    pushed_terms_list = [push_paulistring_clifford_plus_few_magic(circuit, P_rep) for P_rep in P_rep_list]
     rho = cirq.PauliString({bulkq[0]:cirq.I})
-    for k,pair in enumerate(pairs):
-        Xk, Zk = [cirq.PauliString({bulkq[k]:cirq.X}), cirq.PauliString({bulkq[k]:cirq.Z})]
-        plist = [pair[0], pair[1], pair[0]*pair[1]]
-        bulk_p = [Xk, Zk, Xk*Zk]
-        vals = [expectation_paulistring_clifford_plus_few_magic(circuit, op) for op in plist]
-        rho += sum([vals[j]*bulk_p[j] for j in range(3)])
-
-    for k,sin in enumerate(singlets):
-        Zk = cirq.PauliString({bulkq[l1+k]:cirq.Z})
-        val = expectation_paulistring_clifford_plus_few_magic(circuit, sin)
-        rho += val*Zk
-
+    for r in range(1,N+1):
+        for sub in itertools.combinations(range(N), r):
+            P = cirq.PauliString({bulkq[0]:cirq.I})
+            # P_rep=cirq.PauliString({bulkq[0]:cirq.I})
+            term = {1:1}      # initialized to identity operator
+            for ind in sub:
+                P = P*P_list[ind]
+                term = multiply_pauli_op_dicts(term, pushed_terms_list[ind])
+                # P_rep = P_rep*P_rep_list[ind]
+            rho += expectation_from_terms(term)*P
+            # exp=expectation_from_terms(push_paulistring_clifford_plus_few_magic(circuit, P_rep))
+            # rho += exp*P
+            # print(expectation_from_terms(term),exp)
     rho = rho/2**(l1+l2)
-
     return rho.matrix(bulkq)
 
 
 
 
+def stabilizers_supported_on_A(
+    stabilizer_gens: Sequence[cirq.PauliString],
+    qubits: Sequence[cirq.Qid],
+    A: Iterable[cirq.Qid],
+) -> List[cirq.PauliString]:
+    """
+    Given stabilizer generators, return generators of the subgroup consisting of
+    stabilizer elements supported only on subregion A (i.e., identity on complement).
+
+    Output is an independent generating set (phase-free representatives).
+    """
+    n = len(qubits)
+    qindex = {q: i for i, q in enumerate(qubits)}
+    Aset = set(A)
+
+    # Build stabilizer generator matrix S: (k x 2n)
+    S = np.stack([paulistring_to_xz(g, qubits, qindex) for g in stabilizer_gens], axis=0).astype(np.uint8)
+    k = S.shape[0]
+
+    # Indices of complement qubits (outside A)
+    notA = [i for i, q in enumerate(qubits) if q not in Aset]
+
+    # If A is the whole system, subgroup is the whole stabilizer group
+    if len(notA) == 0:
+        basis = gf2_rowspace_basis(S)
+        return [xz_to_paulistring(v, qubits) for v in basis]
+
+    # Extract columns corresponding to complement support (both X and Z bits)
+    cols = notA + [n + i for i in notA]  # x bits outside A, then z bits outside A
+    S_out = S[:, cols]  # shape (k, 2|notA|)
+
+    # We want y^T S_out = 0  <=>  S_out^T y = 0
+    # Solve for y in GF(2)^k
+    Y_basis = gf2_nullspace(S_out.T)  # rows are y vectors (length k)
+
+    if Y_basis.shape[0] == 0:
+        return []  # only identity has support in A
+
+    # Map each y to an operator: s = y^T S (mod 2)
+    # Y_basis is (r x k); compute (r x 2n)
+    SA_candidates = (Y_basis @ S) & 1
+
+    # Reduce to an independent generating set
+    SA_basis = gf2_rowspace_basis(SA_candidates)
+
+    # Convert to Cirq PauliStrings
+    return [xz_to_paulistring(v, qubits) for v in SA_basis]
+
+
+def _coef_to_signbit(coef: complex) -> int:
+    """
+    Accept only overall ±1 coefficients.
+    Returns 0 for +1, 1 for -1.
+    """
+    # Cirq stores coefficient as complex; allow tiny numerical noise.
+    if abs(coef - 1) < 1e-9:
+        return 0
+    if abs(coef + 1) < 1e-9:
+        return 1
+    raise ValueError(f"Only ±1 coefficients supported, got {coef}.")
+
+
+def stabilizer_intersect_phaseblind_group(
+    stabilizer_gens: Sequence[cirq.PauliString],
+    G_gens: Sequence[cirq.PauliString],
+    qubits: Sequence[cirq.Qid],
+) -> List[cirq.PauliString]:
+    """
+    Compute generators for intersection:
+        Stabilizer group (with stabilizer-consistent signs)
+    intersect
+        group generated by G, but allowing a ± sign flip (phase-blind on G side).
+
+    More precisely: return generators of the subgroup of stabilizers whose
+    phase-free Pauli [x|z] lies in span([x|z] of G_gens).
+
+    Notes:
+      - Requires stabilizer_gens and G_gens have coefficients ±1 only.
+      - Phases on G side are ignored in membership (± allowed), but we still
+        only accept ±1 input for simplicity.
+      - Output generators are returned with the stabilizer-consistent sign.
+    """
+    n = len(qubits)
+    qindex = {q: i for i, q in enumerate(qubits)}
+
+    # Build S_xz (k x 2n) and stabilizer sign bits s (k,)
+    S_xz_list = []
+    S_sbits = []
+    for s in stabilizer_gens:
+        x,z, sb = paulistring_to_xz_sign(s, qubits)
+        xz = np.concatenate([x,z])
+        S_xz_list.append(xz)
+        S_sbits.append(sb)
+    S_xz = np.stack(S_xz_list, axis=0).astype(np.uint8)
+    S_sbits = np.array(S_sbits, dtype=np.uint8)  # sign bits of generators
+    k = S_xz.shape[0]
+
+    # Build G_xz (m x 2n); we IGNORE signs for membership, but still parse ±1 safely
+    G_xz_list = []
+    for g in G_gens:
+        x,z, _ = paulistring_to_xz_sign(g, qubits)
+        xz = np.concatenate([x,z])
+        G_xz_list.append(xz)
+    G_xz = np.stack(G_xz_list, axis=0).astype(np.uint8)
+    m = G_xz.shape[0]
+
+    # Solve for (u, v) such that u^T S_xz = v^T G_xz  (phase-free equality)
+    # <=> u^T S_xz + v^T G_xz = 0
+    # Let M = [S_xz; G_xz] of shape (k+m, 2n). We need w=[u,v] such that w^T M = 0.
+    # That is: M^T w = 0.
+    M = np.vstack([S_xz, G_xz]).astype(np.uint8)  # (k+m) x (2n)
+    W_basis = gf2_nullspace(M.T)  # rows are w vectors of length (k+m)
+
+    if W_basis.shape[0] == 0:
+        return []  # only identity in the intersection
+
+    # Map each solution w -> intersection element a = u^T S_xz, with stabilizer signbit = u·S_sbits
+    candidates_xz = []
+    candidates_sbit = []
+
+    for w in W_basis:
+        u = w[:k] & 1
+        # v = w[k:]  (not needed)
+        a_xz = (u @ S_xz) & 1
+        # skip identity (xz all zeros); we do NOT want to return I as a generator
+        if not a_xz.any():
+            continue
+        a_sbit = int((np.dot(u, S_sbits) & 1))  # sign from stabilizer generators
+        candidates_xz.append(a_xz.astype(np.uint8))
+        candidates_sbit.append(a_sbit)
+
+    if not candidates_xz:
+        return []
+
+    C = np.stack(candidates_xz, axis=0).astype(np.uint8)
+
+    # Reduce to an independent generating set for the intersection subgroup (phase-free)
+    # We'll do rowspace basis on C; then pick corresponding signs by expressing each basis row
+    # as a combination of the candidate rows (simple approach below).
+    #
+    # To keep this simple+reliable without bookkeeping, we instead:
+    #   - take the rowspace basis as R (nonzero rows in RREF),
+    #   - for each row r in R, solve C^T alpha = r^T (over GF(2)) to get some combination alpha,
+    #     then compute its signbit as sum alpha_i * candidates_sbit[i].
+    #
+    # This keeps signs consistent with stabilizer group.
+
+    R, _ = gf2_rref(C)
+    basis_rows = [R[i] for i in range(R.shape[0]) if R[i].any()]
+    basis = []
+    # Precompute for solving C^T alpha = r^T:
+    # We solve (C^T) alpha = r (vector length 2n), alpha length = num_candidates.
+    CT = C.T.astype(np.uint8)
+
+    for r in basis_rows:
+        # Find one alpha such that CT @ alpha = r (GF(2))
+        # Convert to solving [CT | r] by RREF.
+        A = np.hstack([CT, r[:, None].astype(np.uint8)])  # (2n) x (num_cand + 1)
+        Ar, piv = gf2_rref(A)
+        nvar = CT.shape[1]
+
+        # Check consistency: no row with all zeros in variables but RHS=1
+        inconsistent = False
+        for i in range(Ar.shape[0]):
+            if not Ar[i, :nvar].any() and Ar[i, nvar] == 1:
+                inconsistent = True
+                break
+        if inconsistent:
+            # Shouldn't happen because r is in rowspace(C).
+            continue
+
+        # Choose a particular solution by setting free vars=0, pivot vars from RHS.
+        alpha = np.zeros(nvar, dtype=np.uint8)
+        pivot_cols = [p for p in piv if p < nvar]
+        # In our rref, each pivot row corresponds to one pivot col; read RHS.
+        prow = 0
+        for pcol in pivot_cols:
+            # Find the row that has pivot at pcol
+            # Since it's RREF, it's the row where Ar[row, pcol]=1 and it's pivot.
+            row = None
+            for rr in range(Ar.shape[0]):
+                if Ar[rr, pcol] == 1:
+                    # ensure it's a pivot: no other 1s in that col
+                    row = rr
+                    break
+            if row is None:
+                continue
+            alpha[pcol] = Ar[row, nvar]  # because free vars=0, pivot var = RHS
+            prow += 1
+
+        # Compute stabilizer-consistent signbit for this basis element
+        sb = 0
+        for i, abit in enumerate(alpha):
+            if abit:
+                sb ^= (candidates_sbit[i] & 1)
+
+        basis.append(xz_sign_to_paulistring(r.astype(np.uint8), sb, qubits))
+
+    return basis
+
+
+
+def reduced_density_matrix_from_circuit(
+    circuit: cirq.Circuit,
+    keep_qubits: list[cirq.Qid],
+    qubit_order: list[cirq.Qid] | None = None,
+) -> np.ndarray:
+    if qubit_order is None:
+        qubit_order = sorted(circuit.all_qubits())
+    sim = cirq.Simulator()
+    result = sim.simulate(circuit, qubit_order=qubit_order)
+    psi = np.array(result.final_state_vector)
+    psi = psi/norm(psi)
+    keep_indices=[qubit_order.index(q) for q in keep_qubits]
+    dim = 2**(len(keep_indices))
+    discard = [i for i in range(len(qubit_order)) if i not in keep_indices]
+    psi = psi.reshape([2 for i in range(len(qubit_order))])
+    rho = np.tensordot(psi, psi.conj(),[discard,discard]).reshape(dim,dim)
+    return rho
