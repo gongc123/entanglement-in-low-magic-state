@@ -11,7 +11,7 @@ from numpy.linalg import norm
 def entropy(rho):
     ens = np.linalg.eigvals(rho)
     ens = [ele for ele in ens if ele> 0.000000000001]
-    return float(sum([-ele*np.log2(ele) for ele in ens]).real)
+    return round(float(sum([-ele*np.log2(ele) for ele in ens]).real),3)
 
 def random_1q_clifford(rng: random.Random) -> cirq.Gate:
     # A simple generating set for single-qubit Cliffords.
@@ -71,11 +71,23 @@ def local_clifford_backbone_1d(n: int, d: int, seed: Optional[int] = None) -> Tu
 
     return cirq.Circuit(moments), qubits
 
+def random_1q_gate(rng: np.random.Generator | None = None) -> cirq.Gate:
+    rng = rng or np.random.default_rng()
+    U = cirq.testing.random_unitary(2, random_state=rng)  # Haar-random 2x2 unitary
+    return cirq.MatrixGate(U)
+
+
+def random_z_rotation_gate(seed) -> cirq.Gate:
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(0.0, 2*np.pi)          # radians
+    return cirq.rz(theta)                      # gate
+
 
 def insert_exactly_k_T_gates(
     circuit: cirq.Circuit,
     qubits: List[cirq.Qid],
     k: int,
+    other_angle = False,
     seed: Optional[int] = None,
     allow_multiple_T_same_spot: bool = False,
     allow_multiple_T_same_qubit_same_moment: bool = False,
@@ -137,7 +149,11 @@ def insert_exactly_k_T_gates(
         ops = list(moment.operations)
         for (m, qi) in chosen:
             if m == mi:
-                ops.append(cirq.T(qubits[qi]))
+                if other_angle == 1:
+                    cirq_U = random_z_rotation_gate(seed+mi+qi)
+                else:
+                    cirq_U = cirq.T
+                ops.append(cirq_U(qubits[qi]))
         new_moments.append(cirq.Moment(ops))
 
     return cirq.Circuit(new_moments)
